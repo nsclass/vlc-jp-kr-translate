@@ -24,7 +24,7 @@ def extract_audio(media_path: str) -> str | None:
     output_path = Path(tempfile.mkdtemp()) / "audio.wav"
 
     cmd = [
-        "ffmpeg", "-y", "-v", "quiet",
+        "ffmpeg", "-y", "-v", "warning",
         "-i", media_path,
         "-vn",
         "-acodec", "pcm_s16le",
@@ -33,8 +33,9 @@ def extract_audio(media_path: str) -> str | None:
         str(output_path),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
         if result.returncode != 0:
+            print(f"ffmpeg stderr: {result.stderr}", file=__import__('sys').stderr)
             return None
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return None
