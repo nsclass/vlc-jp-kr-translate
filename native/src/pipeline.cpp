@@ -117,42 +117,49 @@ auto run_pipeline(const PipelineConfig& config) -> Result<PipelineResult> {
         states.push_back(std::move(*state));
     }
 
-    // Dispatch all chunks to the thread pool for parallel transcription
+    // Dispatch chunks to workers for parallel transcription.
+    // Each worker owns one whisper_state and processes its assigned chunks
+    // SEQUENTIALLY — different workers run in PARALLEL.
+    // This avoids data races: a whisper_state is never shared across threads.
     std::vector<std::vector<Segment>> all_segments(chunks.size());
     std::atomic<int> completed{0};
 
     {
         folly::CPUThreadPoolExecutor executor(num_workers);
 
-        // Run all chunks concurrently under the executor
         folly::coro::blockingWait(
             folly::coro::co_withExecutor(&executor,
                 [&]() -> folly::coro::Task<void> {
-                    std::vector<folly::coro::Task<void>> tasks;
-                    tasks.reserve(chunks.size());
+                    // One coroutine per worker — each owns its state exclusively
+                    std::vector<folly::coro::Task<void>> worker_tasks;
+                    worker_tasks.reserve(num_workers);
 
-                    for (size_t i = 0; i < chunks.size(); ++i) {
-                        auto worker_idx = i % static_cast<size_t>(num_workers);
-                        tasks.push_back(
-                            [&, i, worker_idx]() -> folly::coro::Task<void> {
-                                auto result = transcriber.transcribe_chunk_with_state(
-                                    states[worker_idx].get(), chunks[i]);
-                                if (result) {
-                                    all_segments[i] = std::move(*result);
-                                }
-                                auto done = completed.fetch_add(1,
-                                    std::memory_order_relaxed) + 1;
-                                if (done % 10 == 0 ||
-                                    done == static_cast<int>(chunks.size())) {
-                                    std::cerr << std::format(
-                                        "  transcribed {}/{} chunks\r",
-                                        done, chunks.size());
+                    for (int w = 0; w < num_workers; ++w) {
+                        worker_tasks.push_back(
+                            [&, w]() -> folly::coro::Task<void> {
+                                // Process chunks w, w+N, w+2N, ... sequentially
+                                for (size_t i = static_cast<size_t>(w);
+                                     i < chunks.size();
+                                     i += static_cast<size_t>(num_workers)) {
+                                    auto result = transcriber.transcribe_chunk_with_state(
+                                        states[w].get(), chunks[i]);
+                                    if (result) {
+                                        all_segments[i] = std::move(*result);
+                                    }
+                                    auto done = completed.fetch_add(1,
+                                        std::memory_order_relaxed) + 1;
+                                    if (done % 10 == 0 ||
+                                        done == static_cast<int>(chunks.size())) {
+                                        std::cerr << std::format(
+                                            "  transcribed {}/{} chunks\r",
+                                            done, chunks.size());
+                                    }
                                 }
                                 co_return;
                             }());
                     }
 
-                    co_await folly::coro::collectAllRange(std::move(tasks));
+                    co_await folly::coro::collectAllRange(std::move(worker_tasks));
                 }()));
     }
 
