@@ -80,7 +80,12 @@ Then load the generated SRT files in VLC: Subtitle > Add Subtitle File.
 
 ## Native CLI (C++23) — High-Performance Subtitle Generation
 
-The native CLI decodes audio via FFmpeg C API, applies energy-based VAD (Voice Activity Detection) to skip silence, and transcribes speech using whisper.cpp with Metal GPU acceleration. Uses folly coroutines for structured concurrency (concurrent audio decode + model loading).
+The native CLI decodes audio via FFmpeg C API and transcribes using whisper.cpp with parallel chunked transcription across all CPU cores. Uses folly coroutines for structured concurrency:
+- Stage 1: Concurrent audio decode + model loading (folly::coro::collectAll)
+- Stage 2: Parallel transcription — one whisper state per core, chunks distributed round-robin (folly::coro::collectAllRange on CPUThreadPoolExecutor with hardware_concurrency threads)
+- Stage 3: Merge segments and write SRT
+
+This approach follows the faster-whisper pattern: shared model weights with per-worker compute state, maximizing all available CPU cores without needing VAD silence filtering.
 
 ### Building
 
@@ -117,11 +122,11 @@ Compares C++ pipeline performance against Python baseline, showing per-stage tim
 
 ### Native Architecture
 
-- **audio_decoder** — FFmpeg C API streaming decode to 16kHz mono float, 30s chunks, energy-based VAD filtering
-- **transcriber** — whisper.cpp wrapper with beam search, single-pass transcription
-- **pipeline** — folly::coro::Task stages: decode+VAD || model load (concurrent via collectAll), then transcribe, then write SRT
+- **audio_decoder** — FFmpeg C API streaming decode to 16kHz mono float, 30s chunks
+- **transcriber** — whisper.cpp wrapper: shared model (no_state), per-worker state for parallel transcription
+- **pipeline** — folly::coro::Task stages: decode || model load (collectAll), then parallel chunk transcription (collectAllRange, thread pool = hardware_concurrency)
 - **srt_writer** — bulk SRT output with SoA (Structure of Arrays) subtitle store
-- **types** — AudioChunk, Segment, SubtitleStore (SoA), TimeMap (VAD timestamp remapping)
+- **types** — AudioChunk, Segment, SubtitleStore (SoA), TimeMap
 
 ## Running Tests
 

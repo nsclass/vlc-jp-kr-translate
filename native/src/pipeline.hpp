@@ -24,10 +24,9 @@ struct PipelineResult {
 
 // Run the full pipeline with folly structured concurrency:
 //   1. Decode audio + load whisper model (concurrent via folly::coro::collectAll)
-//   2. VAD-filter speech chunks, concatenate speech-only samples
-//   3. Transcribe speech buffer in one whisper_full pass
-//   4. Remap timestamps back to original-audio time
-//   5. Write SRT
+//   2. Parallel transcription: all chunks across N workers (N = hardware_concurrency)
+//      Each worker has its own whisper_state sharing the same model weights.
+//   3. Merge segments and write SRT
 auto run_pipeline(const PipelineConfig& config) -> Result<PipelineResult>;
 
 } // namespace vsg
