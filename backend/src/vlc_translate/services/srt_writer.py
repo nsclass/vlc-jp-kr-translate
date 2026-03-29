@@ -15,9 +15,8 @@ def ms_to_srt_time(ms: int) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
 
 
-def write_srt(entries: list[SubtitleEntry], filename: str) -> str:
-    """Write subtitle entries to an SRT file. Returns the file path."""
-    output_path = config.OUTPUT_DIR / filename
+def write_srt_to(entries: list[SubtitleEntry], output_path: Path) -> str:
+    """Write subtitle entries to an SRT file at the given path. Returns the file path."""
     lines = []
     for i, entry in enumerate(entries, 1):
         lines.append(str(i))
@@ -27,6 +26,11 @@ def write_srt(entries: list[SubtitleEntry], filename: str) -> str:
 
     output_path.write_text("\n".join(lines), encoding="utf-8")
     return str(output_path)
+
+
+def write_srt(entries: list[SubtitleEntry], filename: str) -> str:
+    """Write subtitle entries to an SRT file in the default output dir. Returns the file path."""
+    return write_srt_to(entries, config.OUTPUT_DIR / filename)
 
 
 def append_srt(entries: list[SubtitleEntry], filepath: str, start_index: int) -> None:

@@ -44,6 +44,32 @@ uvicorn vlc_translate.main:app --port 8765
 #   - "음성 인식 시작 (Start Audio Transcription)" — transcribes Japanese audio with Whisper, then translates
 ```
 
+## Offline CLI Tool
+
+Generate Japanese and Korean SRT files from a video file ahead of time, then load them into VLC.
+
+```bash
+cd backend
+source .venv/bin/activate
+
+# Basic usage — outputs movie_ja.srt and movie_ko.srt next to the input file
+vlc-translate /path/to/japanese-movie.mp4
+
+# Specify output directory
+vlc-translate /path/to/movie.mp4 -o /tmp/subtitles
+
+# Use a different Whisper model (tiny/base/small/medium/large-v3)
+vlc-translate /path/to/movie.mp4 -m large-v3
+
+# Use DeepL instead of Claude CLI for translation
+vlc-translate /path/to/movie.mp4 -b deepl
+
+# Also works as a module
+python -m vlc_translate.cli /path/to/movie.mp4 --help
+```
+
+Then load the generated SRT files in VLC: Subtitle > Add Subtitle File.
+
 ## Running Tests
 
 ```bash
@@ -56,6 +82,8 @@ python -m pytest tests/ -v
 
 ```
 backend/src/vlc_translate/
+  cli.py               — Offline CLI: MP4 → Japanese SRT → Korean SRT
+  __main__.py          — python -m vlc_translate.cli entry point
   main.py              — FastAPI app
   config.py            — environment config
   models.py            — SubtitleEntry, TranscriptionTask dataclasses
