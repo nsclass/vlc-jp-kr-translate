@@ -1,0 +1,31 @@
+[project]
+name = "vlc-translate"
+version = "0.1.0"
+description = "VLC Japanese-to-Korean subtitle translation backend"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "pysubs2>=1.7.0",
+    "httpx>=0.28.0",
+    "python-dotenv>=1.0.0",
+    "chardet>=5.2.0",
+    "faster-whisper>=1.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
