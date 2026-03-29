@@ -67,7 +67,8 @@ auto Transcriber::create_state() -> Result<WhisperStatePtr> {
 
 // ── Parallel-safe chunk transcription ───────────────────────────────────────
 
-auto Transcriber::transcribe_chunk_with_state(void* state, const AudioChunk& chunk)
+auto Transcriber::transcribe_chunk_with_state(void* state, const AudioChunk& chunk,
+                                              int n_threads)
     -> Result<std::vector<Segment>> {
     if (!ctx_ || !state) {
         return std::unexpected("Transcriber or state not initialized");
@@ -81,7 +82,7 @@ auto Transcriber::transcribe_chunk_with_state(void* state, const AudioChunk& chu
 
     auto params = whisper_full_default_params(WHISPER_SAMPLING_BEAM_SEARCH);
     params.language = "ja";
-    params.n_threads = 1;  // single thread per worker — parallelism is across chunks
+    params.n_threads = n_threads;
     params.beam_search.beam_size = 5;
     params.no_timestamps = false;
     params.print_progress = false;

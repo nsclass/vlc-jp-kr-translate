@@ -31,7 +31,9 @@ public:
 
     // Transcribe a single audio chunk using an independent state.
     // Thread-safe: multiple calls with different states can run in parallel.
-    auto transcribe_chunk_with_state(void* state, const AudioChunk& chunk)
+    // n_threads controls CPU threads per transcription call.
+    auto transcribe_chunk_with_state(void* state, const AudioChunk& chunk,
+                                     int n_threads = 1)
         -> Result<std::vector<Segment>>;
 
     // Transcribe full audio buffer in one pass (uses internal default state)

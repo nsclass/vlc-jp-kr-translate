@@ -99,6 +99,23 @@ auto decode_and_load_model(const std::filesystem::path& input_path,
 
 // ── Stage 2: parallel transcription across all cores ────────────────────────
 
+// Metal GPU handles internal parallelism, so too many concurrent whisper
+// states fight over GPU resources and produce empty results.  Cap workers
+// and spread CPU threads across them so total threads ≈ hardware_concurrency.
+constexpr int MAX_WORKERS = 4;
+
+struct WorkerConfig {
+    int num_workers;
+    int threads_per_worker;
+};
+
+auto compute_worker_config() -> WorkerConfig {
+    auto hw = static_cast<int>(std::thread::hardware_concurrency());
+    int workers = std::min(hw, MAX_WORKERS);
+    int threads = std::max(1, hw / workers);
+    return {workers, threads};
+}
+
 auto create_worker_states(Transcriber& transcriber, int num_workers)
     -> Result<std::vector<WhisperStatePtr>> {
 
@@ -117,14 +134,15 @@ auto create_worker_states(Transcriber& transcriber, int num_workers)
 auto transcribe_chunks_parallel(Transcriber& transcriber,
                                 std::vector<WhisperStatePtr>& states,
                                 const std::vector<AudioChunk>& chunks,
-                                int num_workers)
-    -> std::vector<std::vector<Segment>> {
+                                const WorkerConfig& wc)
+    -> Result<std::vector<std::vector<Segment>>> {
 
     std::vector<std::vector<Segment>> all_segments(chunks.size());
     std::atomic<int> completed{0};
+    std::atomic<int> errors{0};
     auto total = static_cast<int>(chunks.size());
 
-    folly::CPUThreadPoolExecutor executor(num_workers);
+    folly::CPUThreadPoolExecutor executor(wc.num_workers);
 
     folly::coro::blockingWait(
         folly::coro::co_withExecutor(&executor,
@@ -132,18 +150,23 @@ auto transcribe_chunks_parallel(Transcriber& transcriber,
                 // One coroutine per worker — each owns its state exclusively.
                 // Worker w processes chunks w, w+N, w+2N, ... sequentially.
                 std::vector<folly::coro::Task<void>> worker_tasks;
-                worker_tasks.reserve(num_workers);
+                worker_tasks.reserve(wc.num_workers);
 
-                for (int w = 0; w < num_workers; ++w) {
+                for (int w = 0; w < wc.num_workers; ++w) {
                     worker_tasks.push_back(
                         [&, w]() -> folly::coro::Task<void> {
                             for (auto i = static_cast<size_t>(w);
                                  i < chunks.size();
-                                 i += static_cast<size_t>(num_workers)) {
+                                 i += static_cast<size_t>(wc.num_workers)) {
                                 auto result = transcriber.transcribe_chunk_with_state(
-                                    states[w].get(), chunks[i]);
+                                    states[w].get(), chunks[i], wc.threads_per_worker);
                                 if (result) {
                                     all_segments[i] = std::move(*result);
+                                } else {
+                                    errors.fetch_add(1, std::memory_order_relaxed);
+                                    std::cerr << std::format(
+                                        "\n  [worker {}] chunk {} failed: {}\n",
+                                        w, i, result.error());
                                 }
                                 auto done = completed.fetch_add(1,
                                     std::memory_order_relaxed) + 1;
@@ -159,6 +182,10 @@ auto transcribe_chunks_parallel(Transcriber& transcriber,
 
                 co_await folly::coro::collectAllRange(std::move(worker_tasks));
             }()));
+
+    if (errors.load() == total) {
+        return std::unexpected("All chunks failed transcription");
+    }
 
     return all_segments;
 }
@@ -197,11 +224,10 @@ auto run_pipeline(const PipelineConfig& config) -> Result<PipelineResult> {
     }
     std::filesystem::create_directories(config.output_dir);
 
-    const auto num_workers = static_cast<int>(std::thread::hardware_concurrency());
+    auto wc = compute_worker_config();
 
     // ── Stage 1 ─────────────────────────────────────────────────────────────
-    std::cerr << std::format("[1/3] Decoding audio + loading model ({} cores)...\n",
-                             num_workers);
+    std::cerr << std::format("[1/3] Decoding audio + loading model...\n");
 
     auto stage1 = decode_and_load_model(config.input_path, config.model_path);
     if (!stage1) {
@@ -213,17 +239,22 @@ auto run_pipeline(const PipelineConfig& config) -> Result<PipelineResult> {
         stage1->chunks.size(), stage1->total_audio_seconds, stage1->elapsed_seconds);
 
     // ── Stage 2 ─────────────────────────────────────────────────────────────
-    std::cerr << std::format("[2/3] Transcribing {} chunks on {} workers...\n",
-                             stage1->chunks.size(), num_workers);
+    std::cerr << std::format(
+        "[2/3] Transcribing {} chunks ({} workers x {} threads)...\n",
+        stage1->chunks.size(), wc.num_workers, wc.threads_per_worker);
     auto transcribe_start = Clock::now();
 
-    auto states = create_worker_states(stage1->transcriber, num_workers);
+    auto states = create_worker_states(stage1->transcriber, wc.num_workers);
     if (!states) {
         return std::unexpected(states.error());
     }
 
-    auto all_segments = transcribe_chunks_parallel(
-        stage1->transcriber, *states, stage1->chunks, num_workers);
+    auto segments_result = transcribe_chunks_parallel(
+        stage1->transcriber, *states, stage1->chunks, wc);
+    if (!segments_result) {
+        return std::unexpected(segments_result.error());
+    }
+    auto all_segments = std::move(*segments_result);
 
     double transcribe_seconds =
         std::chrono::duration<double>(Clock::now() - transcribe_start).count();
