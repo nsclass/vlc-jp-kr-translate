@@ -17,7 +17,7 @@
 #include <folly/coro/Task.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 
-#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <format>
 #include <iostream>
@@ -29,25 +29,21 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-} // namespace
+// ── Stage 1: decode audio and load model concurrently ───────────────────────
 
-auto run_pipeline(const PipelineConfig& config) -> Result<PipelineResult> {
-    auto pipeline_start = Clock::now();
+struct DecodeAndLoadResult {
+    std::vector<AudioChunk> chunks;
+    Transcriber transcriber;
+    double elapsed_seconds;
+    double total_audio_seconds;
+};
 
-    // Validate inputs
-    if (!std::filesystem::exists(config.input_path)) {
-        return std::unexpected("Input file not found: " + config.input_path.string());
-    }
-    std::filesystem::create_directories(config.output_dir);
+auto decode_and_load_model(const std::filesystem::path& input_path,
+                           const std::filesystem::path& model_path)
+    -> Result<DecodeAndLoadResult> {
 
-    const auto num_workers = static_cast<int>(std::thread::hardware_concurrency());
+    auto start = Clock::now();
 
-    // ── Stage 1: Decode audio + Load model (concurrent) ─────────────────────
-    std::cerr << std::format("[1/3] Decoding audio + loading model ({} cores)...\n",
-                             num_workers);
-    auto stage1_start = Clock::now();
-
-    // Decode audio into chunks (runs on one thread of the pool)
     std::vector<AudioChunk> chunks;
     chunks.reserve(256);
     Result<Transcriber> model_result = std::unexpected("not started");
@@ -57,10 +53,9 @@ auto run_pipeline(const PipelineConfig& config) -> Result<PipelineResult> {
 
         auto [decode_res, model_res] = folly::coro::blockingWait(
             folly::coro::collectAll(
-                // Decode all audio into chunks
                 folly::coro::co_withExecutor(&executor,
                     [&]() -> folly::coro::Task<VoidResult> {
-                        auto r = decode_audio(config.input_path, [&](AudioChunk chunk) {
+                        auto r = decode_audio(input_path, [&](AudioChunk chunk) {
                             chunks.push_back(std::move(chunk));
                             if (chunks.size() % 10 == 0) {
                                 std::cerr << std::format(
@@ -72,10 +67,9 @@ auto run_pipeline(const PipelineConfig& config) -> Result<PipelineResult> {
                         });
                         co_return r;
                     }()),
-                // Load whisper model concurrently
                 folly::coro::co_withExecutor(&executor,
                     [&]() -> folly::coro::Task<Result<Transcriber>> {
-                        co_return Transcriber::create(config.model_path);
+                        co_return Transcriber::create(model_path);
                     }())));
 
         if (!decode_res) {
@@ -87,26 +81,27 @@ auto run_pipeline(const PipelineConfig& config) -> Result<PipelineResult> {
     if (!model_result) {
         return std::unexpected(model_result.error());
     }
-    auto transcriber = std::move(*model_result);
-
-    auto stage1_end = Clock::now();
-    double decode_seconds = std::chrono::duration<double>(stage1_end - stage1_start).count();
-
-    double total_audio_s = chunks.empty() ? 0.0 :
-        static_cast<double>(chunks.back().offset_ms + chunks.back().duration_ms()) / 1000.0;
-    std::cerr << std::format("\n  decoded {} chunks ({:.0f}s audio) + model loaded in {:.1f}s\n",
-                             chunks.size(), total_audio_s, decode_seconds);
-
     if (chunks.empty()) {
         return std::unexpected("No audio decoded");
     }
 
-    // ── Stage 2: Parallel transcription across all cores ────────────────────
-    std::cerr << std::format("[2/3] Transcribing {} chunks on {} workers...\n",
-                             chunks.size(), num_workers);
-    auto transcribe_start = Clock::now();
+    double total_audio_s =
+        static_cast<double>(chunks.back().offset_ms + chunks.back().duration_ms()) / 1000.0;
+    double elapsed = std::chrono::duration<double>(Clock::now() - start).count();
 
-    // Create per-worker whisper states (shared model, independent state)
+    return DecodeAndLoadResult{
+        .chunks = std::move(chunks),
+        .transcriber = std::move(*model_result),
+        .elapsed_seconds = elapsed,
+        .total_audio_seconds = total_audio_s,
+    };
+}
+
+// ── Stage 2: parallel transcription across all cores ────────────────────────
+
+auto create_worker_states(Transcriber& transcriber, int num_workers)
+    -> Result<std::vector<WhisperStatePtr>> {
+
     std::vector<WhisperStatePtr> states;
     states.reserve(num_workers);
     for (int i = 0; i < num_workers; ++i) {
@@ -116,62 +111,67 @@ auto run_pipeline(const PipelineConfig& config) -> Result<PipelineResult> {
         }
         states.push_back(std::move(*state));
     }
+    return states;
+}
 
-    // Dispatch chunks to workers for parallel transcription.
-    // Each worker owns one whisper_state and processes its assigned chunks
-    // SEQUENTIALLY — different workers run in PARALLEL.
-    // This avoids data races: a whisper_state is never shared across threads.
+auto transcribe_chunks_parallel(Transcriber& transcriber,
+                                std::vector<WhisperStatePtr>& states,
+                                const std::vector<AudioChunk>& chunks,
+                                int num_workers)
+    -> std::vector<std::vector<Segment>> {
+
     std::vector<std::vector<Segment>> all_segments(chunks.size());
     std::atomic<int> completed{0};
+    auto total = static_cast<int>(chunks.size());
 
-    {
-        folly::CPUThreadPoolExecutor executor(num_workers);
+    folly::CPUThreadPoolExecutor executor(num_workers);
 
-        folly::coro::blockingWait(
-            folly::coro::co_withExecutor(&executor,
-                [&]() -> folly::coro::Task<void> {
-                    // One coroutine per worker — each owns its state exclusively
-                    std::vector<folly::coro::Task<void>> worker_tasks;
-                    worker_tasks.reserve(num_workers);
+    folly::coro::blockingWait(
+        folly::coro::co_withExecutor(&executor,
+            [&]() -> folly::coro::Task<void> {
+                // One coroutine per worker — each owns its state exclusively.
+                // Worker w processes chunks w, w+N, w+2N, ... sequentially.
+                std::vector<folly::coro::Task<void>> worker_tasks;
+                worker_tasks.reserve(num_workers);
 
-                    for (int w = 0; w < num_workers; ++w) {
-                        worker_tasks.push_back(
-                            [&, w]() -> folly::coro::Task<void> {
-                                // Process chunks w, w+N, w+2N, ... sequentially
-                                for (size_t i = static_cast<size_t>(w);
-                                     i < chunks.size();
-                                     i += static_cast<size_t>(num_workers)) {
-                                    auto result = transcriber.transcribe_chunk_with_state(
-                                        states[w].get(), chunks[i]);
-                                    if (result) {
-                                        all_segments[i] = std::move(*result);
-                                    }
-                                    auto done = completed.fetch_add(1,
-                                        std::memory_order_relaxed) + 1;
-                                    if (done % 10 == 0 ||
-                                        done == static_cast<int>(chunks.size())) {
-                                        std::cerr << std::format(
-                                            "  transcribed {}/{} chunks\r",
-                                            done, chunks.size());
-                                    }
+                for (int w = 0; w < num_workers; ++w) {
+                    worker_tasks.push_back(
+                        [&, w]() -> folly::coro::Task<void> {
+                            for (auto i = static_cast<size_t>(w);
+                                 i < chunks.size();
+                                 i += static_cast<size_t>(num_workers)) {
+                                auto result = transcriber.transcribe_chunk_with_state(
+                                    states[w].get(), chunks[i]);
+                                if (result) {
+                                    all_segments[i] = std::move(*result);
                                 }
-                                co_return;
-                            }());
-                    }
+                                auto done = completed.fetch_add(1,
+                                    std::memory_order_relaxed) + 1;
+                                if (done % 10 == 0 || done == total) {
+                                    std::cerr << std::format(
+                                        "  transcribed {}/{} chunks\r",
+                                        done, total);
+                                }
+                            }
+                            co_return;
+                        }());
+                }
 
-                    co_await folly::coro::collectAllRange(std::move(worker_tasks));
-                }()));
-    }
+                co_await folly::coro::collectAllRange(std::move(worker_tasks));
+            }()));
 
-    auto transcribe_end = Clock::now();
-    double transcribe_seconds =
-        std::chrono::duration<double>(transcribe_end - transcribe_start).count();
+    return all_segments;
+}
 
-    // Merge segments from all chunks (already in order since chunks are sequential)
+// ── Build SubtitleStore from raw segments ────────────────────────────────────
+
+auto build_subtitle_store(std::vector<std::vector<Segment>>& all_segments)
+    -> SubtitleStore {
+
     SubtitleStore store;
     for (auto& chunk_segments : all_segments) {
         for (auto& seg : chunk_segments) {
-            auto text = seg.text;
+            auto& text = seg.text;
             auto first = text.find_first_not_of(" \t\n\r");
             auto last  = text.find_last_not_of(" \t\n\r");
             if (first != std::string::npos) {
@@ -182,17 +182,63 @@ auto run_pipeline(const PipelineConfig& config) -> Result<PipelineResult> {
             }
         }
     }
+    return store;
+}
 
-    std::cerr << std::format("\n  transcribed {} segments in {:.1f}s "
-                             "({:.1f}x realtime)\n",
+} // namespace
+
+// ── Public entry point ──────────────────────────────────────────────────────
+
+auto run_pipeline(const PipelineConfig& config) -> Result<PipelineResult> {
+    auto pipeline_start = Clock::now();
+
+    if (!std::filesystem::exists(config.input_path)) {
+        return std::unexpected("Input file not found: " + config.input_path.string());
+    }
+    std::filesystem::create_directories(config.output_dir);
+
+    const auto num_workers = static_cast<int>(std::thread::hardware_concurrency());
+
+    // ── Stage 1 ─────────────────────────────────────────────────────────────
+    std::cerr << std::format("[1/3] Decoding audio + loading model ({} cores)...\n",
+                             num_workers);
+
+    auto stage1 = decode_and_load_model(config.input_path, config.model_path);
+    if (!stage1) {
+        return std::unexpected(stage1.error());
+    }
+
+    std::cerr << std::format(
+        "\n  decoded {} chunks ({:.0f}s audio) + model loaded in {:.1f}s\n",
+        stage1->chunks.size(), stage1->total_audio_seconds, stage1->elapsed_seconds);
+
+    // ── Stage 2 ─────────────────────────────────────────────────────────────
+    std::cerr << std::format("[2/3] Transcribing {} chunks on {} workers...\n",
+                             stage1->chunks.size(), num_workers);
+    auto transcribe_start = Clock::now();
+
+    auto states = create_worker_states(stage1->transcriber, num_workers);
+    if (!states) {
+        return std::unexpected(states.error());
+    }
+
+    auto all_segments = transcribe_chunks_parallel(
+        stage1->transcriber, *states, stage1->chunks, num_workers);
+
+    double transcribe_seconds =
+        std::chrono::duration<double>(Clock::now() - transcribe_start).count();
+
+    auto store = build_subtitle_store(all_segments);
+
+    std::cerr << std::format("\n  transcribed {} segments in {:.1f}s ({:.1f}x realtime)\n",
                              store.count(), transcribe_seconds,
-                             total_audio_s / transcribe_seconds);
+                             stage1->total_audio_seconds / transcribe_seconds);
 
     if (store.count() == 0) {
         return std::unexpected("No speech segments detected");
     }
 
-    // ── Stage 3: Write SRT ──────────────────────────────────────────────────
+    // ── Stage 3 ─────────────────────────────────────────────────────────────
     auto stem = config.input_path.stem().string();
     auto srt_path = config.output_dir / (stem + "_ja.srt");
 
@@ -207,11 +253,11 @@ auto run_pipeline(const PipelineConfig& config) -> Result<PipelineResult> {
     return PipelineResult{
         .store = std::move(store),
         .srt_path = srt_path,
-        .decode_seconds = decode_seconds,
+        .decode_seconds = stage1->elapsed_seconds,
         .transcribe_seconds = transcribe_seconds,
         .total_seconds = total,
-        .total_chunks = static_cast<int>(chunks.size()),
-        .speech_chunks = static_cast<int>(chunks.size()),
+        .total_chunks = static_cast<int>(stage1->chunks.size()),
+        .speech_chunks = static_cast<int>(stage1->chunks.size()),
     };
 }
 
