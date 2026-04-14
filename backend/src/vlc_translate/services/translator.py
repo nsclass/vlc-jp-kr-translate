@@ -42,10 +42,11 @@ class ClaudeCLITranslator:
 
     def _run_claude(self, prompt: str) -> str:
         result = subprocess.run(
-            ["claude", "-p", prompt],
+            ["claude", "-p"],
+            input=prompt,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=600,
         )
         if result.returncode != 0:
             raise RuntimeError(f"claude CLI failed: {result.stderr}")

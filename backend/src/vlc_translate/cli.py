@@ -3,6 +3,9 @@
 Usage:
     python -m vlc_translate.cli <input.mp4> [options]
     vlc-translate <input.mp4> [options]
+
+    # Translate an existing Japanese SRT file to Korean (skip transcription)
+    vlc-translate --srt <input_ja.srt> [options]
 """
 
 import argparse
@@ -16,28 +19,78 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Generate Japanese and Korean subtitles from a video file.",
-    )
-    parser.add_argument("input", help="Path to MP4/MKV media file")
-    parser.add_argument(
-        "-o", "--output",
-        help="Output directory (default: same directory as input file)",
-    )
-    parser.add_argument(
-        "-m", "--model",
-        default="medium",
-        help="Whisper model size: tiny, base, small, medium, large-v3 (default: medium)",
-    )
-    parser.add_argument(
-        "-b", "--backend",
-        default="claude",
-        choices=["claude", "deepl"],
-        help="Translation backend (default: claude, uses `claude -p` CLI)",
-    )
-    args = parser.parse_args()
+def parse_srt(srt_path: Path) -> list:
+    """Parse an SRT file and return a list of SubtitleEntry objects."""
+    import pysubs2
+    from vlc_translate.models import SubtitleEntry
 
+    subs = pysubs2.load(str(srt_path))
+    entries = []
+    for event in subs:
+        text = event.text.replace("\\N", "\n").strip()
+        if text:
+            entries.append(SubtitleEntry(
+                start_ms=event.start,
+                end_ms=event.end,
+                text=text,
+            ))
+    return entries
+
+
+def run_translate_only(args: argparse.Namespace) -> None:
+    """Translate an existing Japanese SRT file to Korean."""
+    srt_path = Path(args.srt).resolve()
+    if not srt_path.exists():
+        log(f"Error: SRT file not found: {srt_path}")
+        sys.exit(1)
+
+    output_dir = Path(args.output).resolve() if args.output else srt_path.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Derive Korean SRT filename from input
+    stem = srt_path.stem
+    if stem.endswith("_ja"):
+        ko_stem = stem[:-3] + "_ko"
+    else:
+        ko_stem = stem + "_ko"
+    ko_srt_path = output_dir / f"{ko_stem}.srt"
+
+    import vlc_translate.config as cfg
+    cfg.TRANSLATION_BACKEND = args.backend
+
+    from vlc_translate.services.translator import translate_all
+    from vlc_translate.services.srt_writer import write_srt_to
+    from vlc_translate.models import SubtitleEntry
+
+    # Step 1: Parse Japanese SRT
+    log("[1/2] Parsing Japanese SRT...")
+    ja_entries = parse_srt(srt_path)
+    if not ja_entries:
+        log("Error: No subtitle entries found in SRT file.")
+        sys.exit(1)
+    log(f"    Found {len(ja_entries)} entries.")
+
+    # Step 2: Translate to Korean
+    log("[2/2] Translating to Korean...")
+    japanese_texts = [e.text for e in ja_entries]
+    korean_texts = asyncio.run(translate_all(japanese_texts))
+
+    ko_entries = [
+        SubtitleEntry(start_ms=e.start_ms, end_ms=e.end_ms, text=kt)
+        for e, kt in zip(ja_entries, korean_texts)
+        if kt
+    ]
+
+    write_srt_to(ko_entries, ko_srt_path)
+    log(f"    Wrote {len(ko_entries)} entries → {ko_srt_path}")
+
+    log("")
+    log("Done! Generated file:")
+    print(str(ko_srt_path))
+
+
+def run_full_pipeline(args: argparse.Namespace) -> None:
+    """Full pipeline: video → Japanese SRT → Korean SRT."""
     input_path = Path(args.input).resolve()
     if not input_path.exists():
         log(f"Error: File not found: {input_path}")
@@ -129,6 +182,41 @@ def main() -> None:
     log("Done! Generated files:")
     print(str(ja_srt_path))
     print(str(ko_srt_path))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate Japanese and Korean subtitles from a video file, "
+                    "or translate an existing Japanese SRT to Korean.",
+    )
+    parser.add_argument("input", nargs="?", help="Path to MP4/MKV media file")
+    parser.add_argument(
+        "--srt",
+        help="Path to Japanese SRT file (translate only, skip transcription)",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        help="Output directory (default: same directory as input file)",
+    )
+    parser.add_argument(
+        "-m", "--model",
+        default="medium",
+        help="Whisper model size: tiny, base, small, medium, large-v3 (default: medium)",
+    )
+    parser.add_argument(
+        "-b", "--backend",
+        default="claude",
+        choices=["claude", "deepl"],
+        help="Translation backend (default: claude, uses `claude -p` CLI)",
+    )
+    args = parser.parse_args()
+
+    if args.srt:
+        run_translate_only(args)
+    elif args.input:
+        run_full_pipeline(args)
+    else:
+        parser.error("Either provide an input video file or use --srt <ja.srt>")
 
 
 if __name__ == "__main__":
