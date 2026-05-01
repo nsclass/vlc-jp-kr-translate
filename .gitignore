@@ -9,3 +9,9 @@ build/
 *.egg
 # Whisper model binaries
 *.bin
+
+# Codev
+.agent-farm/
+.consult/
+codev/.update-hashes.json
+.builders/
